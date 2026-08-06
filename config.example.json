@@ -4,6 +4,20 @@
     "apiKey": "tc-change-me-to-a-secret"
   },
   "upstream": "https://api.anthropic.com",
+  "clientKeys": [
+    {
+      "id": "9a1f2e3d-0000-0000-0000-000000000000",
+      "name": "alice laptop",
+      "sha256": "sha256-hex-of-the-plaintext-key",
+      "enabled": true,
+      "createdAt": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+  "usageLog": {
+    "path": "/var/lib/teamclaude/usage.jsonl",
+    "sink": "http://127.0.0.1:3000/api/internal/usage",
+    "sinkToken": "change-me-shared-with-the-sink"
+  },
   "switchThreshold": 0.98,
   "quotaProbeSeconds": 0,
   "autoUpdate": true,

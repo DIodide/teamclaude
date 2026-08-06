@@ -17,6 +17,8 @@ import { claudeRequestToCodex, applyCodexEffortSupport } from './codex/request-t
 import { createCodexStreamTranslator, aggregateAnthropicStream } from './codex/response-translate.js';
 import { CODEX_HEADER_PREFIX, isCodexQuotaExhausted, codexResetAfterSeconds } from './codex/quota.js';
 import { fetchCodexModels, cloakModelId, uncloakModelId } from './codex/models.js';
+import { resolveClientKey, handleClientKeysRequest } from './client-keys.js';
+import { getUsageLogger } from './usage-log.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -69,16 +71,51 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
   const requestHandler = async (req, res) => {
     try {
-      // Auth check — skip for localhost connections.
-      const clientKey = req.headers['x-api-key'];
+      const presentedKey = req.headers['x-api-key'];
       const isLocal = isLoopbackAddr(req.socket.remoteAddress);
-      if (proxyApiKey && !safeKeyEqual(clientKey, proxyApiKey) && !isLocal) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-        }));
+      const isSharedKey = proxyApiKey ? safeKeyEqual(presentedKey, proxyApiKey) : false;
+      const reqPath = (req.url || '').split('?')[0];
+
+      // Client-key management: strictly loopback. This endpoint both reveals
+      // key metadata and mints access, so unlike status/reload the shared
+      // proxy apiKey does NOT open it — the issuer (a dashboard, a script)
+      // runs on the same box. Handled before the main gate: with
+      // loopbackExempt off, even loopback proxying needs a key, and local
+      // control must keep working or there is no way to install the first one.
+      if (reqPath === '/teamclaude/clientkeys' || reqPath.startsWith('/teamclaude/clientkeys/')) {
+        if (!isLocal) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'clientkeys management is loopback-only' }));
+          return;
+        }
+        await handleClientKeysRequest(req, res, config);
         return;
+      }
+
+      // Auth gate. Historically loopback is exempt (a local claude shares the
+      // operator's trust); `proxy.loopbackExempt: false` turns that off for
+      // deployments where a reverse proxy (nginx) delivers REMOTE clients over
+      // 127.0.0.1 — without it every such request would arrive "local" and skip
+      // the key check entirely. Three credentials pass: the shared proxy
+      // apiKey, or any enabled client key (src/client-keys.js) — whose identity
+      // is remembered on the request for per-key usage attribution. Control
+      // endpoints (status/reload below) accept loopback or the shared key
+      // regardless of the exemption, so a locked-down box can't lock out its
+      // own CLI; client keys deliberately do not open them.
+      const loopbackExempt = config.proxy?.loopbackExempt !== false;
+      const gateActive = Boolean(proxyApiKey) || (config.clientKeys?.length > 0);
+      const isControlPath = reqPath === '/teamclaude/status' || reqPath === '/teamclaude/reload';
+      if (gateActive && !(isLocal && loopbackExempt) && !isSharedKey && !(isControlPath && isLocal)) {
+        const client = resolveClientKey(config, presentedKey);
+        if (!client || isControlPath) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'authentication_error', message: 'Invalid proxy API key' },
+          }));
+          return;
+        }
+        req.tcClient = client;
       }
 
       // Forward-proxy request (HTTP_PROXY): an absolute-form URL is a tool
@@ -263,7 +300,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, clientIdentity = null }) {
   let counter = 0;
   return async (req, res) => {
     try {
@@ -392,7 +429,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
+      // Who is asking, for per-key usage attribution: the base-URL path tags
+      // the request in the auth gate (req.tcClient); the MITM path authorizes
+      // at CONNECT time and binds the identity to the listener (clientIdentity).
+      const startedAt = Date.now();
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client: req.tcClient ?? clientIdentity ?? null };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -409,6 +450,29 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       } finally {
         accountManager.endSession(sessionId);
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, upstreamModel: ctx.upstreamModel, sessionId, pinned: ctx.pinnedIndex != null });
+        // One usage event per proxied request (src/usage-log.js). Telemetry
+        // noise (event_logging) is skipped, as are requests that never routed
+        // to an account (blocked model, unknown pin) — there is nothing to meter.
+        const usageLogger = getUsageLogger(config);
+        if (usageLogger && !isEventLog && ctx.account) {
+          usageLogger.emit({
+            ts: new Date().toISOString(),
+            keyId: ctx.client?.keyId ?? null,
+            keyName: ctx.client?.keyName ?? null,
+            model: ctx.model ?? null,
+            upstreamModel: ctx.upstreamModel ?? null,
+            account: ctx.account,
+            status: ctx.status ?? null,
+            durationMs: Date.now() - startedAt,
+            inputTokens: ctx.usage?.input ?? 0,
+            outputTokens: ctx.usage?.output ?? 0,
+            cacheReadTokens: ctx.usage?.cacheRead ?? 0,
+            cacheCreationTokens: ctx.usage?.cacheCreation ?? 0,
+            stream: ctx.stream ?? null,
+            endpoint: req.url ?? null,
+            sessionId: sessionId ?? null,
+          });
+        }
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
@@ -724,6 +788,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // streaming-first here), so what the CLIENT asked for is tracked separately
   // and the response is folded back into a Messages object when it wanted one.
   const clientWantsStream = isStreamingRequest(body);
+  ctx.stream = clientWantsStream;
   let headers = {};
   let upstreamUrl;
   let codexCacheKey = null;
@@ -1066,14 +1131,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // translated frames, so quota tracking works unchanged.
       const translator = codexStreaming ? createCodexStreamTranslator(codexRequest) : null;
       if (translator && !clientWantsStream) {
-        await collectTranslatedResponse(upstreamRes.body, res, account.index, accountManager, bw, translator);
+        await collectTranslatedResponse(upstreamRes.body, res, account.index, accountManager, bw, translator, ctx);
       } else {
-        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, translator);
+        await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, translator, ctx);
       }
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, account.index, accountManager, ctx);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -1185,7 +1250,7 @@ function translateSSEEvent(event, translator) {
   return out;
 }
 
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, translator = null) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, translator = null, ctx = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1224,10 +1289,10 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
             ok = res.write(frame);
             // Usage is read off the translated frames, so quota accounting works
             // the same for both protocols.
-            parseSSEUsage(frame, accountIndex, accountManager);
+            parseSSEUsage(frame, accountIndex, accountManager, ctx);
           }
         } else {
-          parseSSEUsage(event, accountIndex, accountManager);
+          parseSSEUsage(event, accountIndex, accountManager, ctx);
         }
       }
 
@@ -1251,10 +1316,10 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       if (translator) {
         for (const frame of translateSSEEvent(sseBuffer, translator)) {
           res.write(frame);
-          parseSSEUsage(frame, accountIndex, accountManager);
+          parseSSEUsage(frame, accountIndex, accountManager, ctx);
         }
       } else {
-        parseSSEUsage(sseBuffer, accountIndex, accountManager);
+        parseSSEUsage(sseBuffer, accountIndex, accountManager, ctx);
       }
     }
     // Close any block the upstream left open, so a stream that ends without a
@@ -1284,7 +1349,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
  * request is sent as a stream regardless, so the events are folded back into
  * the object the client expected.
  */
-async function collectTranslatedResponse(webStream, res, accountIndex, accountManager, bodyWriter, translator) {
+async function collectTranslatedResponse(webStream, res, accountIndex, accountManager, bodyWriter, translator, ctx = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1306,7 +1371,7 @@ async function collectTranslatedResponse(webStream, res, accountIndex, accountMa
       for (const event of events) {
         for (const frame of translateSSEEvent(event, translator)) {
           frames.push(frame);
-          parseSSEUsage(frame, accountIndex, accountManager);
+          parseSSEUsage(frame, accountIndex, accountManager, ctx);
         }
       }
     }
@@ -1314,7 +1379,7 @@ async function collectTranslatedResponse(webStream, res, accountIndex, accountMa
     if (sseBuffer.trim()) {
       for (const frame of translateSSEEvent(sseBuffer, translator)) {
         frames.push(frame);
-        parseSSEUsage(frame, accountIndex, accountManager);
+        parseSSEUsage(frame, accountIndex, accountManager, ctx);
       }
     }
     frames.push(...translator.end());
@@ -1402,27 +1467,44 @@ async function handleModelsRequest(req, res, accountManager, upstream, sx, { inc
   }));
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+// Accumulate one response's token counts onto the request context, where the
+// usage logger reads them at request end. Cache tokens ride along: the account
+// quota tracker doesn't care about them, but per-key metering does.
+function addCtxUsage(ctx, { input = 0, output = 0, cacheRead = 0, cacheCreation = 0 }) {
+  if (!ctx) return;
+  const u = (ctx.usage ||= { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 });
+  u.input += input || 0;
+  u.output += output || 0;
+  u.cacheRead += cacheRead || 0;
+  u.cacheCreation += cacheCreation || 0;
+}
+
+function parseSSEUsage(event, accountIndex, accountManager, ctx = null) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      const u = data.message.usage;
+      accountManager.updateUsage(accountIndex, u.input_tokens, 0);
+      addCtxUsage(ctx, { input: u.input_tokens, cacheRead: u.cache_read_input_tokens, cacheCreation: u.cache_creation_input_tokens });
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      addCtxUsage(ctx, { output: data.usage.output_tokens });
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, ctx = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      const u = json.usage;
+      accountManager.updateUsage(accountIndex, u.input_tokens, u.output_tokens);
+      addCtxUsage(ctx, { input: u.input_tokens, output: u.output_tokens, cacheRead: u.cache_read_input_tokens, cacheCreation: u.cache_creation_input_tokens });
     }
   } catch {
     // not JSON or no usage

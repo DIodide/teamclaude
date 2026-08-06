@@ -335,6 +335,54 @@ Log full request/response details to a directory (one file per request):
 teamclaude server --log-to /tmp/requests
 ```
 
+### Per-client API keys + usage metering
+
+Beyond the single shared `proxy.apiKey`, teamclaude can hold a list of named
+**client keys** — one per person — so a key can be revoked without rotating
+everyone's, and every request can be metered against the key that made it.
+Client keys authenticate proxying only (via `x-api-key`, or
+`Proxy-Authorization` on CONNECT); they never open the `/teamclaude/` control
+endpoints.
+
+Keys live in config as SHA-256 hashes — the config file never holds the
+plaintext, so whoever issues the key (a dashboard, a script) keeps the only
+copy:
+
+```json
+"clientKeys": [
+  { "id": "uuid", "name": "alice laptop", "sha256": "<hex of sha256(key)>", "enabled": true }
+]
+```
+
+Manage them at runtime through the loopback-only control endpoint (changes
+apply immediately and persist to config):
+
+```bash
+curl localhost:3456/teamclaude/clientkeys                        # list (no hashes)
+curl -X POST localhost:3456/teamclaude/clientkeys \
+     -d '{"id":"uuid","name":"alice","sha256":"<hex>"}'          # add / update
+curl -X DELETE localhost:3456/teamclaude/clientkeys/uuid         # revoke
+```
+
+With `usageLog` configured, every proxied request emits one JSON event —
+`{ ts, keyId, keyName, model, account, status, durationMs, inputTokens,
+outputTokens, cacheReadTokens, cacheCreationTokens, stream, endpoint }` —
+appended to a JSONL file (the durable record) and/or POSTed fire-and-forget to
+a local HTTP sink with `authorization: Bearer <sinkToken>`:
+
+```json
+"usageLog": {
+  "path": "/var/lib/teamclaude/usage.jsonl",
+  "sink": "http://127.0.0.1:3000/api/internal/usage",
+  "sinkToken": "..."
+}
+```
+
+Running behind a reverse proxy (nginx terminating TLS on the same box)? Set
+`proxy.loopbackExempt: false` — otherwise every remote client arrives over
+127.0.0.1 and would skip the key gate. The control endpoints stay reachable
+from loopback regardless, so the CLI/TUI keep working.
+
 ## Configuration
 
 Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude.json`). A random proxy API key is generated on first use.
@@ -444,6 +492,9 @@ When on, teamclaude routes each **new** session to the least-loaded eligible acc
 | `proxy.port` | Local port the proxy listens on |
 | `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is always exempt |
 | `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |
+| `proxy.loopbackExempt` | Default `true`: loopback clients skip the key gate. Set `false` when a reverse proxy delivers remote clients over 127.0.0.1 (see [Per-client API keys](#per-client-api-keys--usage-metering)); control endpoints stay loopback-reachable regardless |
+| `clientKeys` | Per-person API keys as `{ id, name, sha256, enabled }` (hash of the plaintext key). Managed live via `POST/DELETE /teamclaude/clientkeys`; see [Per-client API keys](#per-client-api-keys--usage-metering) |
+| `usageLog` | Per-request usage events: `{ "path": <jsonl file>, "sink": <local HTTP endpoint>, "sinkToken": <bearer token> }`. Either destination may be omitted; see [Per-client API keys](#per-client-api-keys--usage-metering) |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
