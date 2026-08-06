@@ -380,8 +380,12 @@ a local HTTP sink with `authorization: Bearer <sinkToken>`:
 
 Running behind a reverse proxy (nginx terminating TLS on the same box)? Set
 `proxy.loopbackExempt: false` — otherwise every remote client arrives over
-127.0.0.1 and would skip the key gate. The control endpoints stay reachable
-from loopback regardless, so the CLI/TUI keep working.
+127.0.0.1 and would skip the key gate. In that mode a loopback request
+carrying `X-Forwarded-For` is treated as remote (the reverse proxy always
+appends it; direct on-box callers never do), so forwarded traffic cannot
+reach the control endpoints while the CLI/TUI and a local dashboard keep
+working. Also have the reverse proxy refuse `/teamclaude/` paths outright —
+defense in depth for the control surface.
 
 ## Configuration
 

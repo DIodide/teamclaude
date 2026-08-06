@@ -72,7 +72,15 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   const requestHandler = async (req, res) => {
     try {
       const presentedKey = req.headers['x-api-key'];
-      const isLocal = isLoopbackAddr(req.socket.remoteAddress);
+      const loopbackExempt = config.proxy?.loopbackExempt !== false;
+      // "Local" means the operator's own box. With loopbackExempt off the
+      // operator has declared that a reverse proxy delivers REMOTE clients
+      // over 127.0.0.1 — and those arrivals always carry X-Forwarded-For (the
+      // proxy appends it, and remote clients cannot reach this port directly),
+      // so in that mode a loopback socket WITH the forwarding header is remote.
+      // Direct on-box callers (CLI, TUI, a local dashboard) never set it.
+      const isLocal = isLoopbackAddr(req.socket.remoteAddress)
+        && (loopbackExempt || !req.headers['x-forwarded-for']);
       const isSharedKey = proxyApiKey ? safeKeyEqual(presentedKey, proxyApiKey) : false;
       const reqPath = (req.url || '').split('?')[0];
 
@@ -102,7 +110,6 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // endpoints (status/reload below) accept loopback or the shared key
       // regardless of the exemption, so a locked-down box can't lock out its
       // own CLI; client keys deliberately do not open them.
-      const loopbackExempt = config.proxy?.loopbackExempt !== false;
       const gateActive = Boolean(proxyApiKey) || (config.clientKeys?.length > 0);
       const isControlPath = reqPath === '/teamclaude/status' || reqPath === '/teamclaude/reload';
       if (gateActive && !(isLocal && loopbackExempt) && !isSharedKey && !(isControlPath && isLocal)) {

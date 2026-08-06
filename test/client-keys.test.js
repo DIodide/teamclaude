@@ -124,6 +124,39 @@ test('client keys do not open control endpoints; loopback still does', async () 
   }
 });
 
+test('with loopbackExempt off, forwarded loopback traffic (X-Forwarded-For) is remote', async () => {
+  const upstream = usageUpstream();
+  const upstreamPort = await listen(upstream);
+  const config = {
+    proxy: { apiKey: 'shared-k', loopbackExempt: false },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    clientKeys: [{ id: 'k1', name: 'alice', sha256: sha256Hex('tak_alice') }],
+  };
+  const proxy = createProxyServer(makeAccountManager(), config);
+  const port = await listen(proxy);
+
+  try {
+    // A reverse proxy (nginx) always appends X-Forwarded-For; a request
+    // carrying it must NOT be treated as the on-box operator, or every remote
+    // client would reach the control surface through the proxy.
+    const fwd = { 'x-forwarded-for': '203.0.113.7' };
+    for (const path of ['/teamclaude/status', '/teamclaude/clientkeys']) {
+      const res = await fetch(`http://127.0.0.1:${port}${path}`, { headers: fwd });
+      assert.equal(res.status, 401, `${path} must reject forwarded traffic`);
+      await res.text();
+    }
+    // ...while a client key still proxies through the same forwarded path,
+    // and direct (unforwarded) loopback keeps its control access.
+    assert.equal(await post(port, { ...fwd, 'x-api-key': 'tak_alice' }), 200);
+    const direct = await fetch(`http://127.0.0.1:${port}/teamclaude/clientkeys`);
+    assert.equal(direct.status, 200);
+    await direct.text();
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('clientkeys CRUD upserts, lists (no hashes), and removes — persisting to config', async (t) => {
   const dir = await scratchConfigDir(t);
   const config = { proxy: { apiKey: 'shared-k' }, clientKeys: [] };
