@@ -366,7 +366,9 @@ curl -X DELETE localhost:3456/teamclaude/clientkeys/uuid         # revoke
 
 With `usageLog` configured, every proxied request emits one JSON event —
 `{ ts, keyId, keyName, model, account, status, durationMs, inputTokens,
-outputTokens, cacheReadTokens, cacheCreationTokens, stream, endpoint }` —
+outputTokens, cacheReadTokens, cacheCreationTokens, stream, endpoint,
+logFile }` (`logFile` names the request's `--log-to` file when request
+logging is on, linking the metered event to its full request/response) —
 appended to a JSONL file (the durable record) and/or POSTed fire-and-forget to
 a local HTTP sink with `authorization: Bearer <sinkToken>`:
 

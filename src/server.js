@@ -478,6 +478,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
             stream: ctx.stream ?? null,
             endpoint: req.url ?? null,
             sessionId: sessionId ?? null,
+            logFile: ctx.logFile ?? null,
           });
         }
       }
@@ -663,6 +664,9 @@ function openRequestLog(logDir, reqId) {
   let ended = false;
   const write = (s) => { if (!ended && s) ws.write(Buffer.from(String(s), 'latin1')); };
   return {
+    // Exposed so the usage event can point at this request's log file — the
+    // one durable place the full request/response (including the prompt) lives.
+    filename,
     write,
     // Stream a complete body buffer under a section header.
     body(label, buf, contentType) {
@@ -906,7 +910,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // request head+body are written once, just before the response is logged.
   let log = null;
   let reqLogged = false;
-  const getLog = () => (logDir ? (log ||= openRequestLog(logDir, reqId)) : null);
+  const getLog = () => {
+    if (!logDir) return null;
+    if (!log) {
+      log = openRequestLog(logDir, reqId);
+      // A retry opens a fresh file; the event ends up pointing at the attempt
+      // that actually answered, which is the one worth reading.
+      ctx.logFile = log.filename;
+    }
+    return log;
+  };
   const logRequestHead = () => {
     const l = getLog();
     if (!l || reqLogged) return;
