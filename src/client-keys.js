@@ -54,6 +54,7 @@ export function listClientKeys(config) {
     enabled: k.enabled !== false,
     createdAt: k.createdAt ?? null,
     lastUsedAt: k.id != null ? (lastUsed.get(k.id) ?? null) : null,
+    preferAccounts: Array.isArray(k.preferAccounts) && k.preferAccounts.length ? k.preferAccounts : null,
   }));
 }
 
@@ -62,11 +63,21 @@ export function listClientKeys(config) {
 // change via atomicConfigUpdate, which re-reads the file — so a concurrent
 // `teamclaude login` writing accounts is never clobbered, and vice versa.
 
-/** Add or replace a key by id. `sha256` is the hex digest of the plaintext key. */
-export function upsertClientKey(config, { id, name, sha256, enabled } = {}) {
+/** Add or replace a key by id. `sha256` is the hex digest of the plaintext key.
+ * `preferAccounts` (optional) names accounts this key's requests should try
+ * before pool rotation — the grant that reaches a `restricted` account. */
+export function upsertClientKey(config, { id, name, sha256, enabled, preferAccounts } = {}) {
   if (typeof id !== 'string' || !id) throw new Error('clientKey "id" is required');
   if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(sha256)) {
     throw new Error('clientKey "sha256" must be a 64-char hex SHA-256 digest');
+  }
+  let prefer = null;
+  if (preferAccounts !== undefined && preferAccounts !== null) {
+    if (!Array.isArray(preferAccounts) || preferAccounts.length > 20
+      || preferAccounts.some((n) => typeof n !== 'string' || !n)) {
+      throw new Error('clientKey "preferAccounts" must be an array of up to 20 account names');
+    }
+    prefer = preferAccounts;
   }
   const apply = (cfg) => {
     const keys = (cfg.clientKeys ||= []);
@@ -77,6 +88,11 @@ export function upsertClientKey(config, { id, name, sha256, enabled } = {}) {
       sha256: sha256.toLowerCase(),
       enabled: enabled !== false,
       createdAt: (i >= 0 && keys[i]?.createdAt) || new Date().toISOString(),
+      // Absent in the upsert = keep what the entry had (so a rename doesn't
+      // silently drop a preference); empty array = explicitly clear it.
+      ...(prefer !== null
+        ? (prefer.length ? { preferAccounts: prefer } : {})
+        : (i >= 0 && keys[i]?.preferAccounts?.length ? { preferAccounts: keys[i].preferAccounts } : {})),
     };
   };
   apply(config);

@@ -280,6 +280,60 @@ test('a proxied request emits one usage event attributed to its client key', asy
   }
 });
 
+test('preferAccounts routes a key to its own restricted account; others never see it', async (t) => {
+  // Upstream that records which bearer token served each request.
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push((req.headers.authorization || '').replace(/^Bearer /, ''));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'message', usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const HOUR = 3600_000;
+  const am = new AccountManager(
+    [
+      { name: 'pool', type: 'oauth', accessToken: 'pool-token', refreshToken: 'r', expiresAt: Date.now() + HOUR },
+      { name: 'alice-own', type: 'oauth', accessToken: 'own-token', refreshToken: 'r', expiresAt: Date.now() + HOUR, restricted: true },
+    ],
+    0.98,
+  );
+  const config = {
+    proxy: { apiKey: 'shared-k', loopbackExempt: false },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    clientKeys: [
+      { id: 'ka', name: 'alice', sha256: sha256Hex('tak_alice'), preferAccounts: ['alice-own'] },
+      { id: 'kb', name: 'bob', sha256: sha256Hex('tak_bob') },
+    ],
+  };
+  const proxy = createProxyServer(am, config);
+  const port = await listen(proxy);
+  t.after(() => { proxy.close(); upstream.close(); });
+
+  // Bob (no preference) must land on the pool — the restricted account is
+  // invisible to general rotation.
+  assert.equal(await post(port, { 'x-api-key': 'tak_bob' }), 200);
+  assert.equal(seen.at(-1), 'pool-token');
+
+  // Alice's preference reaches her restricted account.
+  assert.equal(await post(port, { 'x-api-key': 'tak_alice' }), 200);
+  assert.equal(seen.at(-1), 'own-token');
+
+  // When her account can't serve (disabled), she falls back to the pool.
+  am.accounts.find(a => a.name === 'alice-own').disabled = true;
+  assert.equal(await post(port, { 'x-api-key': 'tak_alice' }), 200);
+  assert.equal(seen.at(-1), 'pool-token');
+
+  // Preference upsert via CRUD carries preferAccounts and preserves it on a
+  // rename-only upsert.
+  await upsertClientKey(config, { id: 'kb', name: 'bob', sha256: sha256Hex('tak_bob'), preferAccounts: ['alice-own'] });
+  assert.deepEqual(config.clientKeys.find(k => k.id === 'kb').preferAccounts, ['alice-own']);
+  await upsertClientKey(config, { id: 'kb', name: 'bob-renamed', sha256: sha256Hex('tak_bob') });
+  assert.deepEqual(config.clientKeys.find(k => k.id === 'kb').preferAccounts, ['alice-own']);
+  await upsertClientKey(config, { id: 'kb', name: 'bob-renamed', sha256: sha256Hex('tak_bob'), preferAccounts: [] });
+  assert.equal(config.clientKeys.find(k => k.id === 'kb').preferAccounts, undefined);
+});
+
 test('prompt snapshots store one overwritten file per session, not one per request', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'tc-prompt-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

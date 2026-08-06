@@ -231,6 +231,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 }
 
 /**
+ * The first of the requesting key's preferred accounts that can serve this
+ * request, or null. Resolved by NAME on every attempt — indices renumber on a
+ * hot reload, and a name outliving an index is the safer half of that race.
+ * Uses preferredAvailable (not _isAvailable): being preferred is exactly what
+ * grants access to a `restricted` account. Exported for tests.
+ */
+export function selectPreferredAccount(accountManager, ctx) {
+  for (const name of ctx.preferAccounts || []) {
+    const account = accountManager.accounts.find(a => a.name === name);
+    if (!account || ctx.tried.has(account.index)) continue;
+    if (accountManager.preferredAvailable(account, ctx.model, ctx.advisorModel)) return account;
+  }
+  return null;
+}
+
+/**
  * Resolve an account pin to an index, or null.
  *
  * Accepted forms, first match wins:
@@ -461,6 +477,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // at CONNECT time and binds the identity to the listener (clientIdentity).
       const startedAt = Date.now();
       const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client: req.tcClient ?? clientIdentity ?? null };
+      // The requesting key's preferred accounts (its owner's own tokens). Read
+      // live from config so a control-endpoint upsert applies immediately.
+      if (ctx.client?.keyId != null) {
+        const keyEntry = config.clientKeys?.find(k => k?.id === ctx.client.keyId);
+        if (Array.isArray(keyEntry?.preferAccounts) && keyEntry.preferAccounts.length) {
+          ctx.preferAccounts = keyEntry.preferAccounts;
+        }
+      }
       // Prompt snapshot (usageLog.promptDir): /v1/messages bodies only — the
       // conversation itself, not count_tokens or other endpoints. See
       // writePromptSnapshot for why this is one overwritten file per session.
@@ -729,9 +753,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // A pinned request (via /tc-acct/<name>) forces one exact account and never
   // rotates or fails over: once that account has been tried, `account` is null
   // and the caller gets the exhausted response rather than leaking to another.
+  // Between pin and pool sits preference: an account the requesting client key
+  // prefers (typically its owner's own token, see clientKeys.preferAccounts)
+  // wins whenever it can serve the request, and quietly falls back to normal
+  // pool rotation when it can't — spent, errored, or already tried.
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
-    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
+    : (selectPreferredAccount(accountManager, ctx)
+      ?? accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId));
   if (!account) {
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.

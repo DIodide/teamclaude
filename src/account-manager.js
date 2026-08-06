@@ -68,6 +68,10 @@ function makeAccount(acct, index) {
     orgName: acct.orgName || null,
     priority: acct.priority || 0,
     disabled: acct.disabled || false,
+    // A restricted account (e.g. a member's own token, not shared with the
+    // pool) is invisible to general rotation — reachable only via a client
+    // key's preferAccounts. See _isAvailable / preferredAvailable.
+    restricted: acct.restricted || false,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
     models: acct.models || null,
@@ -552,6 +556,18 @@ export class AccountManager {
   }
 
   _isAvailable(account, model = null, advisorModel = null) {
+    // Restricted accounts are excluded from EVERY general selection path —
+    // rotation, session distribution, preemption checks, probes. Gating here,
+    // at the single availability choke point, is what makes that guarantee
+    // hold everywhere at once. A request whose client key prefers the account
+    // goes through preferredAvailable instead: the preference IS the grant.
+    if (account?.restricted) return false;
+    return this.preferredAvailable(account, model, advisorModel);
+  }
+
+  /** Availability check for an account the requesting client key explicitly
+   * prefers — identical to _isAvailable minus the restricted gate. */
+  preferredAvailable(account, model = null, advisorModel = null) {
     if (!account) return false;
 
     // Manually disabled accounts are skipped entirely until re-enabled.
@@ -1409,6 +1425,7 @@ export class AccountManager {
         orgName: a.orgName || null,
         priority: a.priority || 0,
         disabled: a.disabled || false,
+        restricted: a.restricted || false,
         status: a.status,
         sessions: sessions.perAccount[a.index] || 0,
         quota: { ...a.quota },

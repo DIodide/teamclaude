@@ -367,6 +367,24 @@ curl -X DELETE localhost:3456/teamclaude/clientkeys/uuid         # revoke
 `POST /teamclaude/probe` (same access rules as status/reload) runs a one-shot
 quota probe — the headless equivalent of the TUI's `p`.
 
+#### Preferred and restricted accounts
+
+A client key may name accounts to try BEFORE pool rotation (its owner's own
+token, typically):
+
+```json
+"clientKeys": [
+  { "id": "uuid", "name": "alice", "sha256": "…", "preferAccounts": ["alice-own"] }
+]
+```
+
+Preference wins whenever the named account can serve the request and falls back
+to normal rotation when it can't (spent, disabled, errored). Pair it with
+`"restricted": true` on the account to keep it OUT of general rotation
+entirely — a restricted account is reachable only through a key that prefers
+it, which is what lets a member contribute their own token for their own use
+without sharing it with the pool (drop `restricted` to share it).
+
 With `usageLog` configured, every proxied request emits one JSON event —
 `{ ts, keyId, keyName, model, account, status, durationMs, inputTokens,
 outputTokens, cacheReadTokens, cacheCreationTokens, stream, endpoint,
