@@ -362,6 +362,9 @@ async function serverCommand() {
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
+  // One-shot quota probe for the control endpoint (`prober` is assigned below;
+  // hooks is read per-request, so the late binding is fine).
+  hooks.probe = () => prober?.probeAll();
   hooks.getStatusExtra = () => ({
     server: {
       startedAt: new Date(serverStartedAt).toISOString(),

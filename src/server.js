@@ -111,7 +111,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
       // regardless of the exemption, so a locked-down box can't lock out its
       // own CLI; client keys deliberately do not open them.
       const gateActive = Boolean(proxyApiKey) || (config.clientKeys?.length > 0);
-      const isControlPath = reqPath === '/teamclaude/status' || reqPath === '/teamclaude/reload';
+      const isControlPath = reqPath === '/teamclaude/status' || reqPath === '/teamclaude/reload' || reqPath === '/teamclaude/probe';
       if (gateActive && !(isLocal && loopbackExempt) && !isSharedKey && !(isControlPath && isLocal)) {
         const client = resolveClientKey(config, presentedKey);
         if (!client || isControlPath) {
@@ -154,6 +154,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ...extra, ...status }, null, 2));
+        return;
+      }
+
+      // Probe endpoint — one-shot quota refresh from the zero-spend usage
+      // endpoint, the headless equivalent of pressing 'p' in the TUI. Waits
+      // for completion so the caller can immediately re-read status.
+      if (req.method === 'POST' && reqPath === '/teamclaude/probe') {
+        if (!hooks.probe) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'probe not supported' }));
+          return;
+        }
+        try {
+          await hooks.probe();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
         return;
       }
 
