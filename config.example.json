@@ -16,7 +16,8 @@
   "usageLog": {
     "path": "/var/lib/teamclaude/usage.jsonl",
     "sink": "http://127.0.0.1:3000/api/internal/usage",
-    "sinkToken": "change-me-shared-with-the-sink"
+    "sinkToken": "change-me-shared-with-the-sink",
+    "promptDir": "/var/lib/teamclaude/prompts"
   },
   "switchThreshold": 0.98,
   "quotaProbeSeconds": 0,
@@ -48,8 +49,12 @@
   "routes": [
     {
       "name": "fable",
-      "match": ["*fable*"],
-      "accounts": ["primary-max"],
+      "match": [
+        "*fable*"
+      ],
+      "accounts": [
+        "primary-max"
+      ],
       "color": "magenta"
     }
   ]

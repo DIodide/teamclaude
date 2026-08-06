@@ -280,6 +280,67 @@ test('a proxied request emits one usage event attributed to its client key', asy
   }
 });
 
+test('prompt snapshots store one overwritten file per session, not one per request', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-prompt-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const upstream = usageUpstream();
+  const upstreamPort = await listen(upstream);
+  const config = {
+    proxy: { apiKey: 'shared-k', loopbackExempt: false },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    clientKeys: [{ id: 'k1', name: 'alice', sha256: sha256Hex('tak_alice') }],
+    usageLog: { path: join(dir, 'usage.jsonl'), promptDir: join(dir, 'prompts') },
+  };
+  const proxy = createProxyServer(makeAccountManager(), config);
+  const port = await listen(proxy);
+  t.after(() => { proxy.close(); upstream.close(); });
+
+  const turn = async (messages) => {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': 'tak_alice',
+        'x-claude-code-session-id': 'sess-123',
+      },
+      body: JSON.stringify({ model: 'x', messages }),
+    });
+    await res.text();
+    return res.status;
+  };
+
+  // Two turns of one conversation — the second body contains the first.
+  assert.equal(await turn([{ role: 'user', content: 'hello' }]), 200);
+  assert.equal(await turn([
+    { role: 'user', content: 'hello' },
+    { role: 'assistant', content: 'hi' },
+    { role: 'user', content: 'more' },
+  ]), 200);
+  await new Promise(r => setTimeout(r, 200));
+
+  const { readdir } = await import('node:fs/promises');
+  const files = (await readdir(join(dir, 'prompts'))).filter(f => !f.includes('.tmp'));
+  assert.deepEqual(files, ['s_sess-123.json']);
+  const snap = JSON.parse(await readFile(join(dir, 'prompts', 's_sess-123.json'), 'utf8'));
+  assert.equal(snap.messages.length, 3); // latest turn's body, not the first
+
+  // Both usage events reference the same snapshot file.
+  const events = (await readFile(join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(events.map(e => e.promptFile), ['s_sess-123.json', 's_sess-123.json']);
+
+  // A session-less request gets its own per-request file.
+  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'tak_alice' },
+    body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'one-shot' }] }),
+  });
+  await res.text();
+  await new Promise(r => setTimeout(r, 200));
+  const after = (await readdir(join(dir, 'prompts'))).filter(f => !f.includes('.tmp'));
+  assert.equal(after.length, 2);
+  assert.ok(after.some(f => f.startsWith('r_')));
+});
+
 test('usage logger throttles sink failures and keeps appending to the JSONL file', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'tc-usage-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

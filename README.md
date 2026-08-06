@@ -367,7 +367,7 @@ curl -X DELETE localhost:3456/teamclaude/clientkeys/uuid         # revoke
 With `usageLog` configured, every proxied request emits one JSON event —
 `{ ts, keyId, keyName, model, account, status, durationMs, inputTokens,
 outputTokens, cacheReadTokens, cacheCreationTokens, stream, endpoint,
-logFile }` (`logFile` names the request's `--log-to` file when request
+logFile, promptFile }` (`logFile` names the request's `--log-to` file when request
 logging is on, linking the metered event to its full request/response) —
 appended to a JSONL file (the durable record) and/or POSTed fire-and-forget to
 a local HTTP sink with `authorization: Bearer <sinkToken>`:
@@ -376,9 +376,18 @@ a local HTTP sink with `authorization: Bearer <sinkToken>`:
 "usageLog": {
   "path": "/var/lib/teamclaude/usage.jsonl",
   "sink": "http://127.0.0.1:3000/api/internal/usage",
-  "sinkToken": "..."
+  "sinkToken": "...",
+  "promptDir": "/var/lib/teamclaude/prompts"
 }
 ```
+
+`promptDir` additionally keeps a **prompt snapshot per conversation**: the
+`/v1/messages` body is written to `s_<session-id>.json`, overwritten on every
+turn. Claude Code resends the whole conversation each turn, so the newest body
+already contains everything before it — one file per conversation is the
+complete record at O(conversation) disk instead of the O(turns²) that
+per-request body logging costs. Session-less one-shot calls get a per-request
+`r_*.json`. Events carry the filename as `promptFile`.
 
 Running behind a reverse proxy (nginx terminating TLS on the same box)? Set
 `proxy.loopbackExempt: false` — otherwise every remote client arrives over

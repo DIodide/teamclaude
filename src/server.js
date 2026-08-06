@@ -18,7 +18,7 @@ import { createCodexStreamTranslator, aggregateAnthropicStream } from './codex/r
 import { CODEX_HEADER_PREFIX, isCodexQuotaExhausted, codexResetAfterSeconds } from './codex/quota.js';
 import { fetchCodexModels, cloakModelId, uncloakModelId } from './codex/models.js';
 import { resolveClientKey, handleClientKeysRequest } from './client-keys.js';
-import { getUsageLogger } from './usage-log.js';
+import { getUsageLogger, writePromptSnapshot } from './usage-log.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -441,6 +441,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // at CONNECT time and binds the identity to the listener (clientIdentity).
       const startedAt = Date.now();
       const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client: req.tcClient ?? clientIdentity ?? null };
+      // Prompt snapshot (usageLog.promptDir): /v1/messages bodies only — the
+      // conversation itself, not count_tokens or other endpoints. See
+      // writePromptSnapshot for why this is one overwritten file per session.
+      if ((req.url || '').split('?')[0] === '/v1/messages') {
+        ctx.promptFile = writePromptSnapshot(config, { sessionId, reqId, body });
+      }
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -479,6 +485,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
             endpoint: req.url ?? null,
             sessionId: sessionId ?? null,
             logFile: ctx.logFile ?? null,
+            promptFile: ctx.promptFile ?? null,
           });
         }
       }
