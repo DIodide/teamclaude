@@ -5,11 +5,11 @@
 
 Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
 
-Sits transparently between Claude Code and the Anthropic API, managing multiple Claude Max (or API key) accounts and automatically switching when one approaches its session or weekly quota limit.
+It sits between Claude Code and the Anthropic API, holds several Claude Max (or API key) accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429.
 
 ![TeamClaude TUI](screenshots/teamclaude.png)
 
-## Features
+## Quick start
 
 - **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
 - **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, in both base-URL and MITM modes). Optional **[model routes](#model-routes)** pin model patterns to a specific set of accounts (config, `teamclaude route`, or the TUI settings screen → Manage routing). Advisor requests (Claude Code's `/advisor`) carry a **second** model nested in the tools array; routing sees it too, so the request lands on an account eligible for both the main model and the advisor (falling back to main-model-only routing when no account can serve both)
@@ -41,27 +41,37 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 Requires Node.js 20+.
 
 ```bash
-# Install
 npm install -g @karpeleslab/teamclaude
 
-# Add your first account (opens browser for OAuth)
-teamclaude login
-
-# Add a second account
-teamclaude login
-
-# Start the proxy
-teamclaude server
-
-# In another terminal, run Claude Code through the proxy
-teamclaude run
+teamclaude login     # browser OAuth, run it once per account
+teamclaude server    # start the proxy, shows the TUI
+teamclaude run       # in another terminal: Claude Code through the proxy
 ```
 
-You can also import existing Claude Code credentials instead of logging in:
+Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
+
+## What it does
+
+- Rotates to the next account when the 5h session or 7d weekly bucket reaches the threshold (98% by default), preferring the account whose weekly quota resets soonest.
+- Tracks the per-model weekly cap separately, so an account out of Fable quota is skipped for Fable requests and still serves Opus and Sonnet.
+- Tells a spent quota bucket apart from a per-minute rate limit and only rotates on the first one. Rotating on a rate limit would just move the burst to the next account and drop the warm cache, so it paces the same account instead.
+- Paces requests onto a freshly switched account, so a herd of agents failing over at the same instant doesn't throttle it and cascade down the fleet.
+- TUI with quota bars, reset countdowns, activity log, and settings you can change while it runs, including adding and removing accounts.
+- Catches hardcoded `api.anthropic.com` endpoints (the Claude Design MCP, for one) through a local MITM forward proxy, not only what `ANTHROPIC_BASE_URL` covers.
+- Holds the request open until quota resets instead of returning 429 when every account is spent, so an unattended run finishes on its own (`holdSeconds`, off by default).
+- Refreshes OAuth tokens before they expire and writes them back to config. Client refreshes pass through untouched.
+- Takes any Anthropic-compatible API (DeepSeek, GLM) as a low-priority fallback for when the Claude accounts are done.
+- No dependencies. Node built-ins only.
+
+## Everyday commands
 
 ```bash
-claude /login           # Log into an account in Claude Code
-teamclaude import       # Import its credentials
+teamclaude accounts          # accounts with tier and token status
+teamclaude status            # live proxy status, needs a running server
+teamclaude disable <name>    # pause an account without removing it
+teamclaude priority <name> 1 # rotation order, lower = preferred
+teamclaude alias --install   # make plain `claude` go through the proxy
+teamclaude help              # everything else
 ```
 
 ## Adding Accounts
@@ -419,13 +429,23 @@ defense in depth for the control surface.
 
 ## Configuration
 
-Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude.json`). A random proxy API key is generated on first use.
+Config is at `~/.config/teamclaude.json` (`$XDG_CONFIG_HOME` honoured) and is meant to be hand-editable. A proxy API key is generated on first use. Observed quota goes to a separate `teamclaude.state.json` next to it, safe to delete since quota gets re-learned from traffic.
 
-Volatile runtime state (observed quota) is written separately to `teamclaude.state.json` alongside the config, so the config file stays clean and hand-editable. The state file is safe to delete — quota is simply re-learned from traffic.
+Every field, plus environment variables and network tuning: [docs/configuration.md](docs/configuration.md).
 
-### Environment variables
+## How it works
 
-| Variable | Effect |
+1. Claude Code talks to the local proxy instead of `api.anthropic.com`.
+2. The proxy picks an eligible account, injects that account's real token, and rewrites `account_uuid` in the body to match.
+3. `anthropic-ratelimit-unified-*` response headers feed the session (5h) and weekly (7d) quota view, which survives a restart.
+4. At the threshold, rotation moves on. On a quota 429 the request is resent on another account, so the client never sees the limit while some account still has headroom.
+5. Expiring tokens, transient network errors and client token refreshes are handled inside the proxy, so none of them interrupt the session.
+
+Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
+
+## Documentation
+
+| Page | Contents |
 | --- | --- |
 | `TC_ACCT` | Pin a session to **one** account, bypassing rotation — see [Pin a session to a specific account](#pin-a-session-to-a-specific-account). Accepts `accountUuid`, `orgUuid`, `accountUuid/orgUuid`, or a display name/email. Read by `teamclaude run` and `teamclaude env`, then removed from the environment so it never reaches claude |
 | `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`) |
@@ -769,30 +789,13 @@ TLS is established **end-to-end with `api.anthropic.com` over the tunnel**, so t
 
 ## Security
 
-The only canonical sources for TeamClaude are this repository
-(https://github.com/KarpelesLab/teamclaude) and the
-[`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude)
-npm package. TeamClaude is **never** distributed as a downloadable binary
-archive — be wary of soft-forks that bundle a `.zip` and tell you to extract and
-run it. See [SECURITY.md](SECURITY.md) for details and how to report issues.
+The only canonical sources for TeamClaude are this repository (https://github.com/KarpelesLab/teamclaude) and the [`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude) npm package. TeamClaude is **never** distributed as a downloadable binary archive, so be wary of soft-forks that bundle a `.zip` and tell you to extract and run it. See [SECURITY.md](SECURITY.md) for details and how to report issues.
 
-## Compliance & Terms of Service
+## Compliance
 
-> This is the maintainer's good-faith understanding, **not legal advice.** Anthropic's Terms are theirs to interpret and to change; read the current [Claude Code legal terms](https://code.claude.com/docs/en/legal-and-compliance) and decide for yourself.
+TeamClaude is a local proxy holding your own credentials and driving your own Claude Code CLI. How that lines up with Anthropic's terms, including the multi-subscription question people ask most, is written up in [docs/compliance.md](docs/compliance.md). Not legal advice.
 
-TeamClaude is a **self-hosted local proxy**. You run it on your own machine, it holds *your own* credentials, and it forwards the requests that *your own* Claude Code CLI makes to Anthropic. It is **not** a hosted service, it does not offer "Claude.ai login" to anyone, and it never routes requests on behalf of third parties — it only moves your own traffic through accounts you control.
-
-How you use it is your responsibility. In particular:
-
-- **Use the genuine Claude Code CLI.** Pointing a third-party frontend (opencode and similar) at Pro/Max OAuth credentials is the pattern Anthropic explicitly restricts.
-- **Keep a human in the loop.** The terms expect interactive, human-present use rather than fully unattended automation. The two features that make background calls on their own — [keep-warm](#keep-warm-start-idle-accounts-5h-timers-optional-off-by-default) and the [quota probe](#quota-probe-optional-off-by-default) — are **off by default**.
-- **Only use subscriptions you legitimately purchased.**
-
-On **rotating across multiple subscriptions** — the question people ask most — note that Claude Code's own `/extra-usage` flow already offers signing into a *different* account when you hit a limit. "Switch to another account you own to get more usage" is a move the native client itself surfaces; TeamClaude automates that same switch. Anthropic hasn't explicitly blessed *automated* pooling, so weigh it against the current terms — but the idea that using more than one of your own subscriptions is inherently off-limits is hard to square with the first-party client offering to do the same thing by hand.
-
-To the best of the maintainer's knowledge, using TeamClaude as intended — the real Claude Code CLI, your own subscriptions, a human present — is consistent with Claude Code's Terms. See [#107](https://github.com/KarpelesLab/teamclaude/issues/107) for the full write-up.
-
-## Star History
+## Star history
 
 <a href="https://www.star-history.com/?repos=KarpelesLab%2Fteamclaude&type=date&legend=top-left">
  <picture>

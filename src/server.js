@@ -19,6 +19,7 @@ import { CODEX_HEADER_PREFIX, isCodexQuotaExhausted, codexResetAfterSeconds } fr
 import { fetchCodexModels, cloakModelId, uncloakModelId } from './codex/models.js';
 import { resolveClientKey, handleClientKeysRequest } from './client-keys.js';
 import { getUsageLogger, writePromptSnapshot } from './usage-log.js';
+import { createEgressGuard } from './egress-guard.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -125,6 +126,30 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         req.tcClient = client;
       }
 
+      // Control-plane mutations are refused when the request was issued by a web
+      // page. The gate above exempts loopback from the API key, so without this
+      // any site the operator happens to visit can POST here cross-origin: a
+      // `fetch(..., {mode:'no-cors', body})` with a text/plain content type is a
+      // CORS "simple request", so no preflight is sent and the request lands.
+      // The page cannot read the reply, but the side effect is the point —
+      // forcing the whole fleet onto one named account is a targeted quota
+      // drain, and reload is reachable the same way.
+      //
+      // Origin (and Sec-Fetch-Site) are set by the browser and cannot be
+      // forged from page JavaScript, while curl and the CLI send neither — so
+      // this costs legitimate callers nothing. Deliberately not a content-type
+      // requirement, which would also close the hole but would break the
+      // documented `curl -X POST .../teamclaude/reload` that sends no body.
+      if (req.method === 'POST' && (req.url || '').startsWith('/teamclaude/')
+          && !isSameOriginControlRequest(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          error: 'cross-origin request refused: the control plane is not reachable from a web page',
+        }));
+        return;
+      }
+
       // Forward-proxy request (HTTP_PROXY): an absolute-form URL is a tool
       // proxying plain HTTP to some host. Account logic is only for hosts we
       // manage (the Anthropic upstream, which is HTTPS-only and never arrives
@@ -197,13 +222,70 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // Switch endpoint — make one account the preferred one, the headless
+      // equivalent of picking it with 's' in the TUI. Both do the same single
+      // thing: move currentIndex. That is a preference, and a weak one: _select
+      // abandons it as soon as the account is unavailable, and also whenever any
+      // available account carries a strictly lower priority value. So the answer
+      // reports whether the choice will actually take effect rather than only
+      // that it was recorded. Body:
+      // {"account": "<name|email|accountUuid|accountUuid/orgUuid|orgUuid>"}.
+      // Local control only (no upstream calls); the auth gate above applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/switch') {
+        const names = () => (accountManager.accounts || []).map(a => a.name);
+        let target;
+        try {
+          const raw = await readControlBody(req);
+          target = JSON.parse(raw || '{}')?.account;
+        } catch (err) {
+          // Say which of the two it was, but never echo the parser's own message
+          // back to a caller — that is our internals, not their input.
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof target !== 'string' || !target.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"', accounts: names() }));
+          return;
+        }
+        const index = resolveAccountPin(accountManager, target);
+        if (index == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+          return;
+        }
+        accountManager.currentIndex = index;
+        const name = accountManager.accounts[index].name;
+        // Recording the choice and the choice taking effect are two different
+        // things: selection skips an account it cannot use on the very next
+        // request, so a bare "ok" would be a lie for a disabled or spent target.
+        // The switch still happens (that is the TUI's behaviour) and the answer
+        // says whether traffic will follow it.
+        const { eligible, reason } = accountManager.eligibility(index);
+        // Leave a trace where every other account change already leaves one: the
+        // TUI swaps console.log for its activity pane and headless mode tees it
+        // to the activity log, so this one line covers both. Without it a manual
+        // switch is the only account change that happens invisibly — on exactly
+        // the background-service deployment this endpoint exists for.
+        console.log(`[TeamClaude] Switched to account "${name}" (manual)`
+          + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
+        return;
+      }
+
       return forward(req, res);
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
     }
   };
 
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config });
+  // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
+  // the base listener and the MITM one so both honour the same hold.
+  const egress = createEgressGuard(config, console.error);
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -220,7 +302,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -244,6 +326,41 @@ export function selectPreferredAccount(accountManager, ctx) {
     if (accountManager.preferredAvailable(account, ctx.model, ctx.advisorModel)) return account;
   }
   return null;
+}
+
+/**
+ * Whether a control-plane POST did NOT come from a web page.
+ *
+ * Both headers are browser-set and unforgeable from page JavaScript:
+ *   - `Sec-Fetch-Site` is the explicit answer where it exists (Chrome, Safari,
+ *     Firefox). Anything but `same-origin` / `none` is a page reaching across.
+ *   - `Origin` is the fallback for browsers that send no Sec-Fetch-Site. Its
+ *     mere presence on a POST to a local control endpoint means a page issued
+ *     it; matching it against our own host would mean guessing which of
+ *     localhost / 127.0.0.1 / [::1] / a LAN address the caller used, and a
+ *     browser-issued same-origin call is not a thing worth supporting here.
+ *
+ * Non-browser callers (curl, the CLI, `teamclaude attach`) send neither and are
+ * unaffected.
+ */
+export function isSameOriginControlRequest(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site) return site === 'same-origin' || site === 'none';
+  return !req.headers.origin;
+}
+
+// Read a control-endpoint body as text. Capped, unlike the proxied request path:
+// these endpoints carry a couple of fields, so anything larger is a mistake or an
+// attack and buffering it whole would be the wrong answer either way.
+async function readControlBody(req, limit = 64 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new Error('body too large');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 /**
@@ -343,7 +460,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, clientIdentity = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, clientIdentity = null, egress = null }) {
   let counter = 0;
   return async (req, res) => {
     try {
@@ -360,6 +477,27 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
       const hideActivity = isEventLog && eventLogging !== 'show';
+      // Egress pin (opt-in): with the exit IP off the pinned one — a VPN that
+      // dropped — hold rather than send. Upstream answers a request from an
+      // unexpected region with a 403 that Claude Code reports as a dead session,
+      // so sending it costs a re-login while waiting costs latency. Checked here
+      // rather than per-account: it is a property of the connection, and this is
+      // the one path every request takes, MITM included.
+      if (egress?.enabled()) {
+        const state = await egress.waitUntilPinned({ isAborted: () => res.destroyed });
+        if (res.destroyed) return;
+        if (!state.ok) {
+          res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'proxy_error',
+              message: `Egress is ${state.ip || 'unknown'}, not the pinned ${state.expected.join(', ')} — not sending this request. Check the VPN.`,
+            },
+          }));
+          return;
+        }
+      }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
       if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx); return; }
@@ -645,6 +783,12 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     upstreamSocket.on('end', () => socket.destroy());
     socket.on('close', () => upstreamSocket.destroy());
     upstreamSocket.on('close', () => socket.destroy());
+    // The 101 detaches this socket from upstreamReq, so the request's 'error'
+    // listener no longer covers it. A link that flaps mid-session then raises
+    // 'error' (write EPIPE / read ECONNRESET) on a socket nobody listens to,
+    // which Node escalates to an uncaught exception — one dropped WebSocket
+    // would kill the proxy for every other session. Close the pair instead.
+    upstreamSocket.on('error', () => socket.destroy());
   });
 
   upstreamReq.on('error', (err) => {
@@ -762,6 +906,34 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     : (selectPreferredAccount(accountManager, ctx)
       ?? accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId));
   if (!account) {
+    // Every candidate was refused by upstream (403). Waiting will not help — the
+    // account needs attention, not a retry — so say so plainly rather than
+    // reporting a rate limit. Not a 403 either: the client's own credential is
+    // fine, and a 403 would make it drop its login over someone else's problem.
+    //
+    // Only when the refusals are the WHOLE story, though. If some accounts were
+    // refused and others are merely out of quota, a reset will still serve this
+    // request — so fall through to the retry-after/hold path below rather than
+    // failing fast on the strength of one bad credential. Reporting 502 there
+    // would turn a recoverable exhaustion into a hard error, and silently skip
+    // the holdSeconds wait an unattended run depends on.
+    const rejected = ctx.credentialRejected;
+    const allRefused = rejected?.size > 0 && (ctx.pinnedIndex != null
+      ? rejected.has(accountManager.accounts[ctx.pinnedIndex]?.name)
+      : rejected.size === accountManager.accounts.length);
+    if (allRefused) {
+      const names = [...rejected].map(n => `"${n}"`).join(', ');
+      ctx.status = 502;
+      ctx.account = `(${[...rejected].join(', ')} refused)`;
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: `Upstream refused the credential for account ${names} (403). Check the account, then re-add it with: teamclaude login` },
+        }));
+      }
+      return;
+    }
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.
     if (ctx.pinnedIndex != null) {
@@ -1138,6 +1310,24 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // retry's status check rotates to another account. Bounded to one re-auth
     // per account per request, so a genuinely dead credential surfaces the 401
     // instead of looping.
+    // A 403 ("Request not allowed") is upstream refusing THIS account outright —
+    // not a stale token a refresh could fix, and not anything the client sent.
+    // The client never sees the credential we inject, so it cannot act on the
+    // rejection; Claude Code reads a 403 as "your session is dead", drops its
+    // own login and asks for a re-login over an account problem it has no part
+    // in. Skip the account for the rest of this request and fail over. With no
+    // account left, the no-account branch reports a proxy error instead.
+    if (upstreamRes.status === 403 && !res.headersSent) {
+      await upstreamRes.body?.cancel();
+      // A set, not a name: the no-account branch needs to tell "every account was
+      // refused" (fail fast, nothing to wait for) from "this one was, others are
+      // just out of quota" (still worth holding for a reset).
+      (ctx.credentialRejected ??= new Set()).add(account.name);
+      ctx.tried.add(account.index);
+      console.error(`[TeamClaude] 403 on "${account.name}" — upstream refused the account credential`);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
     if (upstreamRes.status === 401 && account.type === 'oauth' && account.refreshToken
         && retryCount < maxRetries && !ctx.reauthed.has(account.index)) {
       ctx.reauthed.add(account.index);

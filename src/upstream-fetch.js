@@ -13,6 +13,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
+import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 
 // Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
 // multiplexes ALL requests to an origin over a SINGLE HTTP/2 connection; under
@@ -85,14 +86,46 @@ export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
   const { headersTimeoutMs, ...fetchOpts } = opts;
   const timeoutMs = resolveHeadersTimeout(headersTimeoutMs);
   if (sx && useProxy && sx.isProvisioned()) return proxiedFetch(url, fetchOpts, sx, timeoutMs);
-  return USE_GLOBAL_FETCH ? directFetch(url, fetchOpts, timeoutMs) : pooledFetch(url, fetchOpts, timeoutMs);
+  // The global-fetch escape hatch cannot speak CONNECT (that is why the tunnel
+  // is hand-rolled at all), so an upstream proxy overrides it rather than being
+  // silently dropped — on a host that needs the proxy, ignoring it means every
+  // request fails.
+  const useGlobal = USE_GLOBAL_FETCH && !proxyForHost(new URL(url).hostname);
+  return useGlobal ? directFetch(url, fetchOpts, timeoutMs) : pooledFetch(url, fetchOpts, timeoutMs);
+}
+
+/**
+ * `fetch` for teamclaude's own control-plane calls — OAuth token exchange and
+ * refresh, profile, usage. Identical to global fetch when no upstream proxy is
+ * configured; tunneled through it when one is.
+ *
+ * These are not request-forwarding traffic, but they are the calls that decide
+ * whether an account can be added or kept alive at all. Leaving them direct
+ * would mean `login` fails and every token refresh dies on a host that can only
+ * reach the network through a proxy, which is precisely the reported setup.
+ */
+export function proxyFetch(url, opts = {}) {
+  const { headersTimeoutMs, ...rest } = opts;
+  if (!proxyForHost(new URL(url).hostname)) return fetch(url, rest);
+  return pooledFetch(url, rest, resolveHeadersTimeout(headersTimeoutMs));
 }
 
 // Default direct path: HTTP/1.1 over a pooled keep-alive agent, so N concurrent
 // requests use N connections instead of serializing over one h2 connection (#106).
+//
+// "Direct" here means "not via sx". A configured upstream proxy (config
+// `upstreamProxy`, or HTTPS_PROXY — see upstream-proxy.js) still applies: on
+// those hosts there is no such thing as a direct socket to api.anthropic.com,
+// which is the whole of issue #155.
 function pooledFetch(url, opts, timeoutMs) {
   const u = new URL(url);
   const isHttp = u.protocol === 'http:';
+  const port = Number(u.port) || (isHttp ? 80 : 443);
+  const proxy = proxyForHost(u.hostname);
+  if (proxy) {
+    const agent = proxyAgent(proxy, { targetHost: u.hostname, targetPort: port, tls: !isHttp, tlsOptions: opts.tlsOptions || {} });
+    return nodeRequest(u, opts, timeoutMs, { transport: isHttp ? http : https, agent });
+  }
   return nodeRequest(u, opts, timeoutMs, { transport: isHttp ? http : https, agent: isHttp ? httpAgent : httpsAgent });
 }
 
@@ -140,11 +173,23 @@ function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
     const req = transport.request(
       u,
       { method: opts.method || 'GET', headers: opts.headers || {}, agent },
-      (res) => { clearTimeout(timer); resolve(makeResponse(res)); },
+      (res) => { clearTimeout(timer); cleanupAbort(); resolve(makeResponse(res)); },
     );
     const timer = setTimeout(() => req.destroy(headersTimeoutError(timeoutMs)), timeoutMs);
     timer.unref?.();
-    req.once('error', (err) => { clearTimeout(timer); reject(err); });
+
+    // Honour an AbortSignal the way fetch does. Callers that already guard a
+    // hung call this way (oauth's refresh timeout, which otherwise wedges every
+    // request for that account) must keep working when the call is tunneled.
+    const signal = opts.signal;
+    const onAbort = () => req.destroy(signal?.reason ?? new Error('aborted'));
+    const cleanupAbort = () => signal?.removeEventListener?.('abort', onAbort);
+    if (signal) {
+      if (signal.aborted) { clearTimeout(timer); req.destroy(); reject(signal.reason ?? new Error('aborted')); return; }
+      signal.addEventListener?.('abort', onAbort, { once: true });
+    }
+
+    req.once('error', (err) => { clearTimeout(timer); cleanupAbort(); reject(err); });
 
     const body = opts.body;
     const method = (opts.method || 'GET').toUpperCase();
@@ -201,8 +246,10 @@ function makeResponse(res) {
   };
   return {
     status: res.statusCode,
+    ok: res.statusCode >= 200 && res.statusCode < 300,
     headers: makeHeaders(res.headers),
     body: web,
+    async json() { return JSON.parse((await collect()).toString('utf8')); },
     async text() { return (await collect()).toString('utf8'); },
     async arrayBuffer() { const b = await collect(); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
   };

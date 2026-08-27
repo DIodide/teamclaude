@@ -4,12 +4,13 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { installCrashHandlers } from './crash-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { importCodexCredentials, refreshCodexToken, loginCodex, CODEX_DEFAULT_AUTH_PATH } from './codex/oauth.js';
-import { sameIdentity, orgKey, matchAccounts } from './identity.js';
+import { sameIdentity, orgKey, matchAccounts, findUpsertTarget } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
@@ -17,11 +18,14 @@ import { Prober } from './prober.js';
 import { Warmer } from './warmer.js';
 import { CodexTokenRefresher } from './codex/token-refresher.js';
 import { TUI } from './tui.js';
+import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
 import { renderStatus } from './status-renderer.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
+import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
+import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -49,8 +53,16 @@ switch (command) {
     await statusCommand();
     process.exit(0);
     break;
+  case 'attach':
+    await attachCommand();
+    process.exit(0);
+    break;
   case 'accounts':
     await accountsCommand();
+    process.exit(0);
+    break;
+  case 'switch':
+    await switchCommand();
     process.exit(0);
     break;
   case 'remove':
@@ -75,6 +87,10 @@ switch (command) {
     break;
   case 'alias':
     aliasCommand();
+    process.exit(0);
+    break;
+  case 'service':
+    await serviceCommand();
     process.exit(0);
     break;
   case 'probe':
@@ -119,6 +135,13 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  // Installed first: the server is the long-lived process, it runs under a TUI
+  // that repaints over anything Node prints on the way out, and a crash here
+  // takes every routed session with it. Without this, a proxy that vanished
+  // overnight leaves nothing behind to explain why.
+  const crashLog = getCrashLogPath();
+  installCrashHandlers(crashLog);
+
   const config = await loadOrCreateConfig();
 
   // --log-to <dir>
@@ -366,6 +389,10 @@ async function serverCommand() {
   // hooks is read per-request, so the late binding is fine).
   hooks.probe = () => prober?.probeAll();
   hooks.getStatusExtra = () => ({
+    // Read live from the shared config (not a startup snapshot) so the TUI's
+    // blocklist editor shows up in `status` immediately, the same way the
+    // per-request gate in server.js picks it up.
+    blockedModels: [...(config.blockedModels || [])],
     server: {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
@@ -412,6 +439,14 @@ async function serverCommand() {
     // benign runtime handler so a later 'error' is logged rather than thrown.
     server.removeListener('error', onListenError);
     server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
+    // Announce an egress proxy, especially one inherited from the environment:
+    // it changes where every upstream byte goes, and a value nobody typed here
+    // should never be in force silently.
+    const egressProxy = getUpstreamProxy();
+    if (egressProxy.proxy) {
+      const via = egressProxy.source.startsWith('env:') ? ` (from ${egressProxy.source.slice(4)})` : '';
+      console.log(`[TeamClaude] Upstream proxy: ${describeProxy(egressProxy.proxy)}${via}`);
+    }
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
@@ -932,6 +967,122 @@ async function statusCommand() {
   }
 }
 
+// ── attach ──────────────────────────────────────────────────
+
+// The interactive dashboard against a server that is ALREADY running. A proxy
+// installed as a background service has no foreground TUI, so this is the only
+// way to watch and steer it live; it renders from polled status and can only do
+// what the control plane exposes (switch, reload).
+async function attachCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  // Reach the server where it actually binds (see serverCommand): a host set in
+  // the config or the environment is not reachable as localhost, and reporting
+  // "not running" for a server that is plainly up is the worst of the answers.
+  // A wildcard bind is not an address to dial, so dial this machine instead.
+  const bound = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+
+  // Checked before connecting: the dashboard needs raw-mode input, and failing
+  // on that after a successful poll would be a confusing order to report it in.
+  if (!process.stdin.isTTY) {
+    console.error('teamclaude attach needs a terminal. For a one-shot readout use: teamclaude status');
+    process.exit(1);
+  }
+
+  const control = new RemoteControl({ port, host, apiKey: config.proxy.apiKey });
+  let first;
+  try {
+    first = await control.status(); // fail here, with a usable message, not inside the TUI
+  } catch (err) {
+    console.error(`Cannot connect to proxy at ${host}:${port}`);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+
+  await new Promise(resolve => {
+    const session = createAttachSession({ control, config, onQuit: resolve });
+    // The status just fetched is the first frame: without it the alt-screen opens
+    // on a disconnected, empty dashboard until the first poll lands.
+    session.am.applyStatus(first);
+    session.start();
+  });
+}
+
+// ── switch ──────────────────────────────────────────────────
+
+// Manual account switch against a RUNNING server — the headless equivalent of
+// pressing 's' in the TUI, which is unreachable when the proxy runs as a
+// background service. Nothing is written to the config: like the TUI's switch
+// this is a runtime preference that dies with the process, so the server is the
+// only place that can answer or apply it.
+async function switchCommand() {
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const headers = { 'x-api-key': config.proxy.apiKey };
+  const name = args[1] && !args[1].startsWith('-') ? args[1] : null;
+
+  try {
+    if (!name) {
+      const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers });
+      // Something answered on the port. Whether it is our proxy is a separate
+      // question, and getting it wrong would blame a down server for a reply we
+      // simply could not read — or report an unreadable reply as an empty fleet.
+      const data = res.ok ? await res.json().catch(() => null) : null;
+      if (!data || !Array.isArray(data.accounts)) {
+        console.error(`Unexpected reply from localhost:${port} (HTTP ${res.status}) — no account list in it.`);
+        console.error('Something is listening there, but it does not answer like this teamclaude version.');
+        process.exit(1);
+      }
+      if (!data.accounts.length) {
+        console.log('No accounts configured.');
+        return;
+      }
+      for (const a of data.accounts) {
+        // Flag what would stop traffic reaching an account. The TUI shows this in
+        // its table, so leaving it out here would make the headless half of the
+        // feature the only place a disabled account looks switchable.
+        const state = a.disabled ? 'disabled' : (a.status && a.status !== 'active' ? a.status : null);
+        console.log(`${a.name === data.currentAccount ? '*' : ' '} ${a.name}${state ? `  (${state})` : ''}`);
+      }
+      console.log('\nSwitch with: teamclaude switch <name>');
+      return;
+    }
+
+    const res = await fetch(`http://localhost:${port}/teamclaude/switch`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      // Our own errors are strings. A server too old to know this endpoint
+      // forwards the request upstream instead, and Anthropic's error is an
+      // object — printing that raw gives the user "[object Object]".
+      const detail = typeof data.error === 'string' ? data.error : null;
+      console.error(detail || `Switch failed: unexpected reply from localhost:${port} (HTTP ${res.status}).`);
+      if (!detail) console.error('An older server without this endpoint answers this way; restart it to pick up the new version.');
+      if (data.accounts?.length) {
+        console.error('Known accounts:');
+        for (const n of data.accounts) console.error(`  ${n}`);
+      }
+      process.exit(1);
+    }
+    console.log(`Switched to "${data.account}"`);
+    // Recorded is not the same as in effect: rotation skips an account it cannot
+    // use on the very next request, so saying nothing here would be a quiet lie.
+    if (data.eligible === false) {
+      console.error(`Warning: "${data.account}" is ${data.reason || 'not currently eligible'}, so requests will not route to it until that changes.`);
+    }
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + port);
+    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
+    process.exit(1);
+  }
+}
+
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
@@ -1128,6 +1279,50 @@ function aliasCommand() {
     alias.installAlias({ shell });
   } else {
     alias.printAlias({ shell });
+  }
+}
+
+// ── service ─────────────────────────────────────────────────
+
+async function serviceCommand() {
+  const sub = args[1] || 'status';
+  const kind = serviceKind();
+  if (!kind) {
+    console.error(`teamclaude service: no service integration for ${process.platform}`);
+    console.error('Run the proxy yourself with: teamclaude server --headless');
+    process.exit(1);
+  }
+  // Carry an explicit config path into the unit: a service started by launchd or
+  // systemd does not inherit the shell's TEAMCLAUDE_CONFIG, so a non-default
+  // config would silently be ignored and the service would serve a different
+  // (or empty) account list than the CLI does.
+  const configPath = process.env.TEAMCLAUDE_CONFIG || null;
+
+  switch (sub) {
+    case 'install': {
+      const res = await installService({ configPath });
+      if (!res.ok) { console.error(`teamclaude service install failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'uninstall': {
+      const res = await uninstallService();
+      if (!res.ok) { console.error(`teamclaude service uninstall failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'print':
+      process.stdout.write(renderService({ configPath }));
+      break;
+    case 'status': {
+      const s = await serviceStatus();
+      console.log(`Service:   ${s.installed ? s.file : 'not installed'}`);
+      console.log(`State:     ${s.running ? `running${s.pid ? ` (pid ${s.pid})` : ''}` : s.detail}`);
+      if (kind === 'launchd') console.log(`Logs:      ${logPath()}`);
+      else console.log('Logs:      journalctl --user --unit teamclaude.service');
+      break;
+    }
+    default:
+      console.error('Usage: teamclaude service <install|uninstall|status|print>');
+      process.exit(1);
   }
 }
 
@@ -1458,9 +1653,17 @@ Commands:
                       the session to one account (see Environment below)
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
+  service <sub>       Run the proxy as a user service that starts at login and
+                      restarts on its own: install | uninstall | status | print
+                      (LaunchAgent on macOS, systemd --user unit on Linux;
+                      'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
+  attach              Open the live dashboard against a running server; s
+                      switches account, R reloads config, q leaves it running
   accounts            List configured accounts
+  switch [NAME]       Make the running server prefer one account (as 's' in the
+                      TUI does); with no NAME, list accounts and mark the current
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
@@ -1481,6 +1684,7 @@ Options:
   --name NAME         Set account name (import/login)
   --org NAME|UUID     Disambiguate when an email spans multiple orgs (remove/priority/api)
   --from PATH         Credentials path (import, default: ~/.claude/.credentials.json;
+                      on macOS the default falls back to the Keychain;
                       with --codex, default: ~/.codex/auth.json)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
@@ -1510,12 +1714,32 @@ launched with and without --no-mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
+POST /teamclaude/switch {"account": "<name>"} makes one account the preferred
+one, which is what 'teamclaude switch' calls.
+
+Upstream proxy. On a host with no direct route to the internet, set
+"upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every
+outbound connection — request forwarding, OAuth login, token refresh, profile
+and usage — is CONNECT-tunneled through it, TLS end to end. HTTPS_PROXY /
+ALL_PROXY are honored when the config says nothing, NO_PROXY exempts hosts, and
+"upstreamProxy": false ignores the environment entirely. Settable live in the
+TUI settings screen. Distinct from "proxy" (the local port Claude Code talks to)
+and from sx.org (a specific residential-egress provider with its own policy).
+
+Egress pin (opt-in, off unless configured). Set "egress": { "pin": "auto" } to
+hold requests whenever the exit IP is not the pinned one — a VPN that dropped
+mid-session otherwise sends the request from an unexpected region, and upstream
+answers 403, which Claude Code reports as a dead session and demands a re-login.
+"auto" pins whatever address the server sees first; an explicit IP (or a list of
+them) pins those. Held requests wait up to holdSeconds (default 120), then get a
+503. See config.example.json.
 
 A global npm install self-updates in the background (checked once/day, applied
 on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
 "autoUpdate": false in the config.
 
 Config: ${getConfigPath()}
+Crash log: ${getCrashLogPath()} (server; written when the process dies unexpectedly)
 `);
 }
 
@@ -1558,9 +1782,9 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   };
 
   // Deduplicate by account+org identity (same email in a different org is a
-  // distinct account), then by name.
-  let idx = config.accounts.findIndex(a => sameIdentity(a, account));
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
+  // distinct account), then by name — but only where the name is not standing in
+  // for a different account+org, which is exactly the multi-org case below.
+  const idx = findUpsertTarget(config.accounts, account);
 
   if (idx >= 0) {
     // Same account+org: refresh credentials and org info, but keep the existing
