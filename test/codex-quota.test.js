@@ -150,10 +150,16 @@ function codexAcct(extra = {}) {
 }
 
 test('updateQuota routes a codex account to the codex parser', () => {
+  // The manager's stale-window discard runs against the real clock, so the
+  // fixture's fixed reset-at (fine for the pure-parser tests above) reads as
+  // expired once that date passes and the quota is nulled again. Give this
+  // test a reset in the real future instead.
+  const resetAt = Math.floor(Date.now() / 1000) + 604_709;
+  const headers = { ...LIVE_HEADERS, 'x-codex-primary-reset-at': String(resetAt) };
   const am = new AccountManager([codexAcct()], 0.98);
-  am.updateQuota(0, LIVE_HEADERS);
+  am.updateQuota(0, headers);
   assert.equal(am.accounts[0].quota.unified7d, 0);
-  assert.equal(am.accounts[0].quota.unified7dReset, 1786201952 * 1000);
+  assert.equal(am.accounts[0].quota.unified7dReset, resetAt * 1000);
   assert.equal(am.accounts[0].planType, 'plus');
   assert.equal(am.accounts[0].usage.totalRequests, 1);
 });
