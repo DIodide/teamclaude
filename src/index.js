@@ -799,6 +799,7 @@ async function envCommand() {
   const lines = buildClaudeEnvLines({
     port, useMitm, caPath, holdSeconds: config.holdSeconds,
     account, proxyApiKey: config.proxy?.apiKey || '',
+    modelDiscovery: (config.accounts || []).some(a => a.protocol === 'codex' && !a.disabled),
   });
   process.stdout.write(`${lines.join('\n')}\n`);
 
@@ -852,6 +853,13 @@ async function runCommand() {
   // gets inherited by every tool and MCP server claude spawns.
   const tcAcct = (process.env.TC_ACCT || '').trim();
   delete env.TC_ACCT;
+  // A codex account adds GPT models to the gateway's /v1/models catalog, but
+  // Claude Code only fetches it when this flag is set — arm it so the picker
+  // shows them without per-user shell setup. Gateway discovery reads
+  // ANTHROPIC_BASE_URL, so this only has effect in --no-mitm (base-URL) mode.
+  if ((config.accounts || []).some(a => a.protocol === 'codex' && !a.disabled)) {
+    env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = '1';
+  }
   // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
   // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
   // MITM mode too, and keeps the pin out of the API path.

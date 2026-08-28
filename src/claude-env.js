@@ -30,7 +30,7 @@ export function encodePinComponent(s) {
 // `/tc-acct/` prefix. TC_ACCT itself is then unset, so the pin does not leak
 // into claude or anything it spawns — same reasoning as `run` deleting it from
 // the child environment.
-export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '' }) {
+export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '', modelDiscovery = false }) {
   const lines = [];
   const pin = (account || '').trim();
 
@@ -55,6 +55,11 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
 
   // The pin is now carried by the routing itself; keep it out of the child.
   if (pin) lines.push('unset TC_ACCT');
+
+  // Codex accounts extend the gateway's /v1/models catalog, but Claude Code only
+  // fetches it when this flag is set. Emitted in both modes for shell-env parity
+  // with `run`; discovery itself only fires in base-URL (--no-mitm) mode.
+  if (modelDiscovery) lines.push('export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1');
 
   // Parity with `run`: if the proxy may hold the connection on exhaustion, raise
   // the client-side timeout so it doesn't give up mid-hold.
